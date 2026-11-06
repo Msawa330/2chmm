@@ -1,6 +1,6 @@
 // 2chmm要約リーダー (standalone) service worker
 // アプリ本体はネットワーク優先（データ更新をすぐ反映）、記事JSONはキャッシュ優先で高速表示。
-const VERSION = 'v1';
+const VERSION = 'v2';
 const CORE = ['./', 'index.html', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', (e) => {
