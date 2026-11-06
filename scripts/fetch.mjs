@@ -11,7 +11,6 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DATA_DIR = join(ROOT, 'data');
 const ARTICLES_DIR = join(DATA_DIR, 'articles');
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
-const BODY_FETCH_LIMIT = 150;      // 1回の実行で新規に本文を取得する上限
 const ARCHIVE_PER_BLOG = 30;       // ブログ別アーカイブの保持件数
 const COMMENT_LIMIT = 300;
 const OBANYU_DAYS = 14;
@@ -461,56 +460,17 @@ async function main() {
     log('merged previous: bodies', existingBodies.size, 'articles total', articles.size);
   } catch { log('no previous data (first run)'); }
 
-  /* 5) 本文取得 (新規分のみ・上限あり) */
-  const feedUrlByBlog = new Map();
-  const sorted = [...articles.values()].sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
-  const todo = sorted.filter(a => !existingBodies.has(a.id)).slice(0, BODY_FETCH_LIMIT);
-  log('body fetch targets:', todo.length);
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < todo.length) {
-      const a = todo[cursor++];
-      try {
-        if (wpPosts.has(a.id)) {
-          const { wpId, contentHtml } = wpPosts.get(a.id);
-          const frag = parseHTML(contentHtml);
-          const items = [];
-          for (const c of frag.children) walkBody(c, {}, items, a.url);
-          const posts = itemsToPosts(items);
-          let comments = [];
-          try {
-            const cs = await fetchJSON(`${OBANYU_URL}wp-json/wp/v2/comments?post=${wpId}&per_page=100&_fields=content`);
-            for (const c of cs || []) {
-              const cf = parseHTML(c.content?.rendered || '');
-              const t = textOf(cf).replace(/\u00A0/g, ' ').split('\n').map(s => s.trim()).filter(Boolean).join(' ').trim();
-              const clean = t.replace(/[\s*]*$/, '');
-              if (clean && clean.length <= 2000) comments.push(clean);
-            }
-          } catch { /* comments optional */ }
-          comments = comments.slice(0, COMMENT_LIMIT);
-          await writeFile(join(ARTICLES_DIR, a.id + '.json'), JSON.stringify({ id: a.id, publishedAt: a.publishedAt, posts, comments }));
-          stats.bodiesNew++; stats.comments += comments.length;
-        } else {
-          const { text, finalUrl } = await fetchText(a.url);
-          const root = parseHTML(text);
-          const pageTime = extractPublishedAt(root, text);
-          if (pageTime && (!a.publishedAt || Math.abs(pageTime - a.publishedAt) > 60000)) a.publishedAt = pageTime;
-          const feed = extractFeedUrl(root, finalUrl);
-          if (feed && !feedUrlByBlog.has(a.blogKey)) feedUrlByBlog.set(a.blogKey, feed);
-          const posts = extractBody(root, finalUrl);
-          const comments = extractComments(root);
-          if (!posts.length) throw new Error('empty body');
-          await writeFile(join(ARTICLES_DIR, a.id + '.json'), JSON.stringify({ id: a.id, publishedAt: a.publishedAt, posts, comments }));
-          stats.bodiesNew++; stats.comments += comments.length;
-        }
-      } catch (e) {
-        stats.failed.push(`body ${a.url}: ${e.message}`);
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: 5 }, worker));
+  /* fetch-state: 本文取得の失敗回数を記録し、5回失敗した記事は以後スキップする */
+  const statePath = join(DATA_DIR, 'fetch-state.json');
+  const fetchState = { failed: {} };
+  try {
+    const s = JSON.parse(await readFile(statePath, 'utf8'));
+    if (s && s.failed && typeof s.failed === 'object') fetchState.failed = s.failed;
+    log('fetch-state loaded: failed entries', Object.keys(fetchState.failed).length);
+  } catch { log('no fetch-state (first run)'); }
 
-  /* 6) ブログ別アーカイブ拡充 (各ブログ自身のフィード・4並列) */
+  /* 5) ブログ別アーカイブ拡充 (各ブログ自身のフィード・4並列) — 本文取得より前に行い、追加分も同じ回で本文取得の対象にする */
+  const feedUrlByBlog = new Map();
   const feedTargets = [...blogs.values()].filter(b => !b.pinned);
   let feedCursor = 0;
   const feedWorker = async () => {
@@ -540,7 +500,72 @@ async function main() {
   };
   await Promise.all(Array.from({ length: 4 }, feedWorker));
 
+  /* 6) 本文取得 (本文のない全記事が対象・上限なし。ブログ間でラウンドロビンに並べ、途中で止まっても特定ブログだけが残らないようにする) */
+  const byBlog = new Map();
+  for (const a of articles.values()) {
+    if (existingBodies.has(a.id)) { delete fetchState.failed[a.id]; continue; }
+    if ((fetchState.failed[a.id] || 0) >= 5) continue;
+    if (!byBlog.has(a.blogKey)) byBlog.set(a.blogKey, []);
+    byBlog.get(a.blogKey).push(a);
+  }
+  const groups = [...byBlog.values()].map(g => g.sort((x, y) => (y.publishedAt || 0) - (x.publishedAt || 0)));
+  groups.sort((g1, g2) => (g2[0].publishedAt || 0) - (g1[0].publishedAt || 0));
+  const todo = [];
+  for (let rank = 0; ; rank++) {
+    let added = false;
+    for (const g of groups) if (rank < g.length) { todo.push(g[rank]); added = true; }
+    if (!added) break;
+  }
+  log('body fetch targets:', todo.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < todo.length) {
+      const a = todo[cursor++];
+      try {
+        if (wpPosts.has(a.id)) {
+          const { wpId, contentHtml } = wpPosts.get(a.id);
+          const frag = parseHTML(contentHtml);
+          const items = [];
+          for (const c of frag.children) walkBody(c, {}, items, a.url);
+          const posts = itemsToPosts(items);
+          let comments = [];
+          try {
+            const cs = await fetchJSON(`${OBANYU_URL}wp-json/wp/v2/comments?post=${wpId}&per_page=100&_fields=content`);
+            for (const c of cs || []) {
+              const cf = parseHTML(c.content?.rendered || '');
+              const t = textOf(cf).replace(/\u00A0/g, ' ').split('\n').map(s => s.trim()).filter(Boolean).join(' ').trim();
+              const clean = t.replace(/[\s*]*$/, '');
+              if (clean && clean.length <= 2000) comments.push(clean);
+            }
+          } catch { /* comments optional */ }
+          comments = comments.slice(0, COMMENT_LIMIT);
+          await writeFile(join(ARTICLES_DIR, a.id + '.json'), JSON.stringify({ id: a.id, publishedAt: a.publishedAt, posts, comments }));
+          delete fetchState.failed[a.id];
+          stats.bodiesNew++; stats.comments += comments.length;
+        } else {
+          const { text, finalUrl } = await fetchText(a.url);
+          const root = parseHTML(text);
+          const pageTime = extractPublishedAt(root, text);
+          if (pageTime && (!a.publishedAt || Math.abs(pageTime - a.publishedAt) > 60000)) a.publishedAt = pageTime;
+          const feed = extractFeedUrl(root, finalUrl);
+          if (feed && !feedUrlByBlog.has(a.blogKey)) feedUrlByBlog.set(a.blogKey, feed);
+          const posts = extractBody(root, finalUrl);
+          const comments = extractComments(root);
+          if (!posts.length) throw new Error('empty body');
+          await writeFile(join(ARTICLES_DIR, a.id + '.json'), JSON.stringify({ id: a.id, publishedAt: a.publishedAt, posts, comments }));
+          delete fetchState.failed[a.id];
+          stats.bodiesNew++; stats.comments += comments.length;
+        }
+      } catch (e) {
+        fetchState.failed[a.id] = (fetchState.failed[a.id] || 0) + 1;
+        stats.failed.push(`body ${a.url}: ${e.message}`);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: 8 }, worker));
+
   /* 7) index.json 出力 */
+  await writeFile(statePath, JSON.stringify(fetchState));
   const finalBodies = new Set();
   for (const f of await readdir(ARTICLES_DIR)) if (f.endsWith('.json')) finalBodies.add(f.replace('.json', ''));
   const outArticles = [...articles.values()]
@@ -551,6 +576,6 @@ async function main() {
   await writeFile(join(DATA_DIR, 'index.json'), JSON.stringify(index));
   stats.blogs = outBlogs.length; stats.articles = outArticles.length; stats.bodies = outArticles.filter(a => a.hasBody).length;
   log('DONE', JSON.stringify({ blogs: stats.blogs, articles: stats.articles, bodies: stats.bodies, bodiesNew: stats.bodiesNew, commentsTotal: stats.comments, failedCount: stats.failed.length }));
-  for (const f of stats.failed.slice(0, 40)) log('FAILED:', f);
+  for (const f of stats.failed) log('FAILED:', f);
 }
 main().catch(e => { console.error('[fetch] fatal', e); process.exit(1); });
