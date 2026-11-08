@@ -460,12 +460,15 @@ async function main() {
     log('merged previous: bodies', existingBodies.size, 'articles total', articles.size);
   } catch { log('no previous data (first run)'); }
 
-  /* fetch-state: 本文取得の失敗回数を記録し、5回失敗した記事は以後スキップする */
+  /* fetch-state: 本文取得の失敗回数と失敗理由を記録し、5回失敗した記事は以後スキップする */
   const statePath = join(DATA_DIR, 'fetch-state.json');
-  const fetchState = { failed: {} };
+  const fetchState = { failed: {}, errors: {} };
   try {
     const s = JSON.parse(await readFile(statePath, 'utf8'));
     if (s && s.failed && typeof s.failed === 'object') fetchState.failed = s.failed;
+    if (s && s.errors && typeof s.errors === 'object') fetchState.errors = s.errors;
+    // 旧方式（理由を記録していなかった頃）に上限へ達した記事は、取得方法の見直しに合わせて1回だけ再挑戦させる
+    for (const k of Object.keys(fetchState.failed)) if (fetchState.failed[k] >= 5 && !fetchState.errors[k]) fetchState.failed[k] = 4;
     log('fetch-state loaded: failed entries', Object.keys(fetchState.failed).length);
   } catch { log('no fetch-state (first run)'); }
 
@@ -541,23 +544,45 @@ async function main() {
           comments = comments.slice(0, COMMENT_LIMIT);
           await writeFile(join(ARTICLES_DIR, a.id + '.json'), JSON.stringify({ id: a.id, publishedAt: a.publishedAt, posts, comments }));
           delete fetchState.failed[a.id];
+          delete fetchState.errors[a.id];
           stats.bodiesNew++; stats.comments += comments.length;
         } else {
-          const { text, finalUrl } = await fetchText(a.url);
-          const root = parseHTML(text);
-          const pageTime = extractPublishedAt(root, text);
-          if (pageTime && (!a.publishedAt || Math.abs(pageTime - a.publishedAt) > 60000)) a.publishedAt = pageTime;
-          const feed = extractFeedUrl(root, finalUrl);
-          if (feed && !feedUrlByBlog.has(a.blogKey)) feedUrlByBlog.set(a.blogKey, feed);
-          const posts = extractBody(root, finalUrl);
-          const comments = extractComments(root);
-          if (!posts.length) throw new Error('empty body');
-          await writeFile(join(ARTICLES_DIR, a.id + '.json'), JSON.stringify({ id: a.id, publishedAt: a.publishedAt, posts, comments }));
-          delete fetchState.failed[a.id];
-          stats.bodiesNew++; stats.comments += comments.length;
+          // 取得できないブログがあるため、URLの別形式も順に試す（https切替・www有無・Seesaa標準ドメイン）
+          const candidates = [a.url];
+          try {
+            const u = new URL(a.url);
+            if (u.protocol === 'http:') { const alt = new URL(a.url); alt.protocol = 'https:'; candidates.push(alt.href); }
+            const noWww = new URL(a.url);
+            if (u.hostname.startsWith('www.')) noWww.hostname = u.hostname.slice(4); else noWww.hostname = 'www.' + u.hostname;
+            candidates.push(noWww.href);
+            const sld = u.hostname.replace(/^www\./, '').split('.')[0];
+            if (sld && !u.hostname.endsWith('.seesaa.net')) candidates.push(`https://${sld}.seesaa.net${u.pathname}`);
+          } catch { /* ignore */ }
+          let lastErr = null, done = false;
+          for (const cand of [...new Set(candidates)]) {
+            try {
+              const { text, finalUrl } = await fetchText(cand, cand === a.url ? 25000 : 12000);
+              const root = parseHTML(text);
+              const posts = extractBody(root, finalUrl);
+              if (!posts.length) throw new Error('empty body');
+              const pageTime = extractPublishedAt(root, text);
+              if (pageTime && (!a.publishedAt || Math.abs(pageTime - a.publishedAt) > 60000)) a.publishedAt = pageTime;
+              const feed = extractFeedUrl(root, finalUrl);
+              if (feed && !feedUrlByBlog.has(a.blogKey)) feedUrlByBlog.set(a.blogKey, feed);
+              const comments = extractComments(root);
+              await writeFile(join(ARTICLES_DIR, a.id + '.json'), JSON.stringify({ id: a.id, publishedAt: a.publishedAt, posts, comments }));
+              delete fetchState.failed[a.id];
+              delete fetchState.errors[a.id];
+              stats.bodiesNew++; stats.comments += comments.length;
+              done = true;
+              break;
+            } catch (e) { lastErr = e; }
+          }
+          if (!done) throw lastErr || new Error('fetch failed');
         }
       } catch (e) {
         fetchState.failed[a.id] = (fetchState.failed[a.id] || 0) + 1;
+        fetchState.errors[a.id] = String(e.message || e).slice(0, 120);
         stats.failed.push(`body ${a.url}: ${e.message}`);
       }
     }
