@@ -81,6 +81,45 @@ const scrollMemo = {};
 function listKey() { return state.blog ? 'blog:' + state.blog : 'top'; }
 function saveListScroll() { if (!state.article) scrollMemo[listKey()] = window.scrollY; }
 function restoreListScroll() { window.scrollTo(0, scrollMemo[listKey()] || 0); }
+// 記事内のリンク（動画など）へ飛んだあと閉じると、画面が再読み込みされて一覧に戻ってしまうことがある。
+// 表示中の記事・絞り込み・スクロール位置を保存しておき、再読み込み時は30分以内なら元の記事と位置へ復帰する。
+const VIEW_KEY = 'viewStateV1';
+let articleScrollY = 0;
+let viewSaveAt = 0;
+function saveView() {
+  try {
+    localStorage.setItem(VIEW_KEY, JSON.stringify({ t: Date.now(), blog: state.blog, articleId: state.article ? state.article.meta.id : null, articleScrollY, memo: scrollMemo }));
+  } catch { /* ignore */ }
+}
+function scheduleSaveView() {
+  const now = Date.now();
+  if (now - viewSaveAt < 300) return;
+  viewSaveAt = now;
+  saveView();
+}
+window.addEventListener('scroll', () => {
+  if (state.article) articleScrollY = window.scrollY; else scrollMemo[listKey()] = window.scrollY;
+  scheduleSaveView();
+}, { passive: true });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveView(); });
+window.addEventListener('pagehide', saveView);
+function restoreView() {
+  try {
+    const v = JSON.parse(localStorage.getItem(VIEW_KEY) || 'null');
+    if (v && Date.now() - v.t <= 30 * 60 * 1000) {
+      if (v.memo) Object.assign(scrollMemo, v.memo);
+      if (v.blog && blogByKey(v.blog)) state.blog = v.blog;
+      if (v.articleId) {
+        const meta = state.data.articles.find(a => a.id === v.articleId);
+        if (meta) { openArticle(v.articleId, v.articleScrollY || 0); return; }
+      }
+      render();
+      restoreListScroll();
+      return;
+    }
+  } catch { /* ignore */ }
+  render();
+}
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 function relTime(ts) {
   if (!ts) return '';
@@ -148,17 +187,19 @@ function renderBlog() {
 }
 let lastNavAt = 0;
 function bindList() {
-  $app.querySelectorAll('[data-blog]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = el.dataset.blog || null; render(); restoreListScroll(); }));
-  $app.querySelectorAll('[data-more]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = el.dataset.more; render(); restoreListScroll(); }));
-  $app.querySelectorAll('[data-clear]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = null; render(); restoreListScroll(); }));
+  $app.querySelectorAll('[data-blog]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = el.dataset.blog || null; render(); restoreListScroll(); saveView(); }));
+  $app.querySelectorAll('[data-more]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = el.dataset.more; render(); restoreListScroll(); saveView(); }));
+  $app.querySelectorAll('[data-clear]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = null; render(); restoreListScroll(); saveView(); }));
   $app.querySelectorAll('[data-art]').forEach(el => el.addEventListener('click', () => { if (Date.now() - lastNavAt < 600) return; openArticle(el.dataset.art); }));
 }
-async function openArticle(id) {
+async function openArticle(id, restoreY = null) {
   const meta = state.data.articles.find(a => a.id === id);
   if (!meta) return;
   lastNavAt = Date.now();
   saveListScroll();
   state.article = { meta, body: null };
+  articleScrollY = restoreY || 0;
+  saveView();
   state.read.add(id); saveRead();
   renderArticle();
   window.scrollTo(0, 0);
@@ -167,7 +208,10 @@ async function openArticle(id) {
     const res = await fetch('data/articles/' + id + '.json');
     state.article.body = await res.json();
   } catch { state.article.body = { posts: [], comments: [], missing: true }; }
-  if (state.article && state.article.meta.id === id) renderArticle();
+  if (state.article && state.article.meta.id === id) {
+    renderArticle();
+    if (restoreY) { window.scrollTo(0, restoreY); articleScrollY = restoreY; }
+  }
 }
 function segHTML(s) {
   if (s.img) return '<img loading="lazy" src="' + esc(s.img) + '" alt="" data-view="' + esc(s.img) + '">';
@@ -200,7 +244,7 @@ function renderArticle() {
   }
   h += '<button class="backbtn" id="aBack2">← 一覧に戻る</button></div></div>';
   $app.innerHTML = h;
-  const back = () => { lastNavAt = Date.now(); state.article = null; requestAnimationFrame(() => { render(); restoreListScroll(); }); };
+  const back = () => { lastNavAt = Date.now(); state.article = null; articleScrollY = 0; saveView(); requestAnimationFrame(() => { render(); restoreListScroll(); }); };
   document.getElementById('aBack').addEventListener('click', back);
   document.getElementById('aBack2').addEventListener('click', back);
   $app.querySelectorAll('[data-view]').forEach(el => el.addEventListener('click', () => openViewer(el.dataset.view)));
@@ -283,13 +327,13 @@ if ('serviceWorker' in navigator) { try { navigator.serviceWorker.register('sw.j
   try {
     const cache = await caches.open('data-2chmm');
     const hit = await cache.match('data/index.json');
-    if (hit) { state.data = await hit.json(); render(); rendered = true; }
+    if (hit) { state.data = await hit.json(); restoreView(); rendered = true; }
   } catch { /* キャッシュが無ければネットワークのみ */ }
   try {
     const res = await fetch('data/index.json', { cache: 'no-cache' });
     try { const cache = await caches.open('data-2chmm'); cache.put('data/index.json', res.clone()); } catch { /* ignore */ }
     const fresh = await res.json();
-    if (!rendered) { state.data = fresh; render(); rendered = true; }
+    if (!rendered) { state.data = fresh; restoreView(); rendered = true; }
     else if (fresh.generatedAt !== state.data.generatedAt && !state.article) {
       const y = window.scrollY;
       state.data = fresh;
