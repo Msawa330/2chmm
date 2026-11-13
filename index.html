@@ -23,6 +23,8 @@ a{color:var(--accent);overflow-wrap:anywhere}
 header.top{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 12px;display:flex;align-items:center;gap:8px}
 header.top .ttl{font-weight:700;font-size:16px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 header.top .upd{font-size:11px;color:var(--dim)}
+header.top .rbtn{flex-shrink:0;border:1px solid var(--line);border-radius:999px;padding:3px 12px;font-size:12px;color:var(--dim);background:var(--card)}
+header.top .rbtn:disabled{opacity:.55}
 main{max-width:760px;margin:0 auto;padding:0 12px 40px}
 .chips{display:flex;flex-wrap:nowrap;gap:6px;padding:10px 0 2px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
 .chips::-webkit-scrollbar{display:none}
@@ -169,10 +171,29 @@ function render() {
   if (state.blog) return renderBlog();
   renderTop();
 }
+let refreshing = false;
 function headerHTML() {
   const g = state.data.generatedAt ? new Date(state.data.generatedAt) : null;
   const upd = g ? ('データ: ' + (g.getMonth() + 1) + '/' + g.getDate() + ' ' + String(g.getHours()).padStart(2, '0') + ':' + String(g.getMinutes()).padStart(2, '0')) : '';
-  return '<header class="top"><div class="ttl">2chmm要約リーダー</div><div class="upd">' + esc(upd) + '</div></header>';
+  return '<header class="top"><div class="ttl">2chmm要約リーダー</div><div class="upd">' + esc(upd) + '</div><button class="rbtn" id="reloadBtn"' + (refreshing ? ' disabled' : '') + '>' + (refreshing ? '読み込み中…' : '再読み込み') + '</button></header>';
+}
+function bindHeader() {
+  const rb = document.getElementById('reloadBtn');
+  if (rb) rb.addEventListener('click', refreshData);
+}
+// ヘッダーの再読み込み：最新の一覧データを取り直して、その場で表示を更新する（位置は保つ）
+async function refreshData() {
+  if (refreshing) return;
+  refreshing = true;
+  const y0 = window.scrollY;
+  if (!state.article) { render(); restoreScrollSticky(y0); }
+  try {
+    const res = await fetch('data/index.json', { cache: 'no-cache' });
+    try { const cache = await caches.open('data-2chmm'); cache.put('data/index.json', res.clone()); } catch { /* ignore */ }
+    state.data = await res.json();
+  } catch { /* オフライン時は何もしない */ }
+  refreshing = false;
+  if (!state.article) { const y = window.scrollY; render(); restoreScrollSticky(y); }
 }
 function chipsHTML() {
   let h = '<div class="chips"><button class="chip' + (!state.blog ? ' on' : '') + '" data-blog="">すべて</button>';
@@ -199,6 +220,7 @@ function renderTop() {
   h += '</main>';
   $app.innerHTML = h;
   bindList();
+  bindHeader();
 }
 function renderBlog() {
   const b = blogByKey(state.blog);
@@ -210,6 +232,7 @@ function renderBlog() {
   h += '</section><button class="backbtn" data-clear="1">← 一覧に戻る</button></main>';
   $app.innerHTML = h;
   bindList();
+  bindHeader();
 }
 let lastNavAt = 0;
 function bindList() {
