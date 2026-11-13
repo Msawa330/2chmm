@@ -80,7 +80,28 @@ const state = { data: null, blog: null, article: null, read: new Set(JSON.parse(
 const scrollMemo = {};
 function listKey() { return state.blog ? 'blog:' + state.blog : 'top'; }
 function saveListScroll() { if (!state.article) scrollMemo[listKey()] = window.scrollY; }
-function restoreListScroll() { window.scrollTo(0, scrollMemo[listKey()] || 0); }
+function restoreListScroll() { restoreScrollSticky(scrollMemo[listKey()] || 0); }
+// 画面遷移の直後は、記事側の慣性スクロール等で保存済みの位置が上書きされないよう記録を止める。
+// 復元は1回で効かないことがあるため、位置が合うまで数回かけ直す（ユーザーが触ったら中止）。
+let navLockUntil = 0;
+let stickyRestore = null;
+function cancelStickyRestore() { if (stickyRestore) { clearTimeout(stickyRestore.timer); stickyRestore = null; } }
+function lockNav() { navLockUntil = Date.now() + 450; cancelStickyRestore(); }
+function restoreScrollSticky(y) {
+  cancelStickyRestore();
+  const apply = () => {
+    window.scrollTo(0, y);
+    if (Math.abs(window.scrollY - y) <= 2) { stickyRestore = null; return; }
+    if (stickyRestore && stickyRestore.tries > 0) {
+      stickyRestore.tries--;
+      stickyRestore.timer = setTimeout(() => requestAnimationFrame(apply), 60);
+    } else stickyRestore = null;
+  };
+  stickyRestore = { tries: 6, timer: 0 };
+  requestAnimationFrame(apply);
+}
+window.addEventListener('touchstart', cancelStickyRestore, { passive: true });
+window.addEventListener('wheel', cancelStickyRestore, { passive: true });
 // 記事内のリンク（動画など）へ飛んだあと閉じると、画面が再読み込みされて一覧に戻ってしまうことがある。
 // 表示中の記事・絞り込み・スクロール位置を保存しておき、再読み込み時は30分以内なら元の記事と位置へ復帰する。
 const VIEW_KEY = 'viewStateV1';
@@ -98,6 +119,7 @@ function scheduleSaveView() {
   saveView();
 }
 window.addEventListener('scroll', () => {
+  if (Date.now() < navLockUntil) return; // 遷移直後は慣性スクロールで保存位置を上書きしない
   if (state.article) articleScrollY = window.scrollY; else scrollMemo[listKey()] = window.scrollY;
   scheduleSaveView();
 }, { passive: true });
@@ -187,9 +209,9 @@ function renderBlog() {
 }
 let lastNavAt = 0;
 function bindList() {
-  $app.querySelectorAll('[data-blog]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = el.dataset.blog || null; render(); restoreListScroll(); saveView(); }));
-  $app.querySelectorAll('[data-more]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = el.dataset.more; render(); restoreListScroll(); saveView(); }));
-  $app.querySelectorAll('[data-clear]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); state.blog = null; render(); restoreListScroll(); saveView(); }));
+  $app.querySelectorAll('[data-blog]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); lockNav(); state.blog = el.dataset.blog || null; render(); restoreListScroll(); saveView(); }));
+  $app.querySelectorAll('[data-more]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); lockNav(); state.blog = el.dataset.more; render(); restoreListScroll(); saveView(); }));
+  $app.querySelectorAll('[data-clear]').forEach(el => el.addEventListener('click', () => { lastNavAt = Date.now(); saveListScroll(); lockNav(); state.blog = null; render(); restoreListScroll(); saveView(); }));
   $app.querySelectorAll('[data-art]').forEach(el => el.addEventListener('click', () => { if (Date.now() - lastNavAt < 600) return; openArticle(el.dataset.art); }));
 }
 async function openArticle(id, restoreY = null) {
@@ -197,6 +219,7 @@ async function openArticle(id, restoreY = null) {
   if (!meta) return;
   lastNavAt = Date.now();
   saveListScroll();
+  lockNav();
   state.article = { meta, body: null };
   articleScrollY = restoreY || 0;
   saveView();
@@ -210,7 +233,7 @@ async function openArticle(id, restoreY = null) {
   } catch { state.article.body = { posts: [], comments: [], missing: true }; }
   if (state.article && state.article.meta.id === id) {
     renderArticle();
-    if (restoreY) { window.scrollTo(0, restoreY); articleScrollY = restoreY; }
+    if (restoreY) { restoreScrollSticky(restoreY); articleScrollY = restoreY; }
   }
 }
 function segHTML(s) {
@@ -244,7 +267,7 @@ function renderArticle() {
   }
   h += '<button class="backbtn" id="aBack2">← 一覧に戻る</button></div></div>';
   $app.innerHTML = h;
-  const back = () => { lastNavAt = Date.now(); state.article = null; articleScrollY = 0; saveView(); requestAnimationFrame(() => { render(); restoreListScroll(); }); };
+  const back = () => { lastNavAt = Date.now(); lockNav(); state.article = null; articleScrollY = 0; saveView(); requestAnimationFrame(() => { render(); restoreListScroll(); }); };
   document.getElementById('aBack').addEventListener('click', back);
   document.getElementById('aBack2').addEventListener('click', back);
   $app.querySelectorAll('[data-view]').forEach(el => el.addEventListener('click', () => openViewer(el.dataset.view)));
@@ -338,7 +361,7 @@ if ('serviceWorker' in navigator) { try { navigator.serviceWorker.register('sw.j
       const y = window.scrollY;
       state.data = fresh;
       render();
-      window.scrollTo(0, y);
+      restoreScrollSticky(y);
     }
   } catch (e) {
     if (!rendered) $app.innerHTML = '<main><div class="empty">データを読み込めませんでした。<br>しばらく待ってから開き直してください。</div></main>';
